@@ -129,17 +129,52 @@ def request_admin_restart():
         return False
 
 def scan_roots():
-    # Search the drive for Minecraft-related artifacts, but inspect only the
-    # allowlisted Java/archive/metadata extensions and require MC context.
+    """Return available fixed volumes without probing floppy/empty removable drives.
+
+    Path.exists() on A:/B: can trigger Windows' "Insert disk" dialog.  The
+    logical-drive bitmask plus GetDriveTypeW avoids touching the volume.
+    Removable media can still be scanned explicitly with the Folder button.
+    """
     roots = []
     if os.name == "nt":
-        for letter in string.ascii_uppercase:
-            drive = Path(letter + ":\\\\")
-            if drive.exists():
-                roots.append(drive)
+        try:
+            get_logical_drives = ctypes.windll.kernel32.GetLogicalDrives
+            get_logical_drives.restype = ctypes.c_uint32
+            get_drive_type = ctypes.windll.kernel32.GetDriveTypeW
+            get_drive_type.argtypes = [ctypes.c_wchar_p]
+            get_drive_type.restype = ctypes.c_uint
+            mask = get_logical_drives()
+            DRIVE_FIXED = 3
+            for index, letter in enumerate(string.ascii_uppercase):
+                if not (mask & (1 << index)):
+                    continue
+                # Only fixed local volumes are auto-scanned. This deliberately
+                # excludes floppy, optical, and removable drives that may be empty.
+                root = letter + ":\\"
+                try:
+                    if get_drive_type(root) == DRIVE_FIXED:
+                        roots.append(Path(root))
+                except Exception:
+                    continue
+        except Exception:
+            # Safe fallback: do not probe A:/B: or removable volumes.
+            for letter in "CDEFGHIJKLMNOPQRSTUVWXYZ":
+                root = letter + ":\\"
+                try:
+                    if os.path.isdir(root):
+                        roots.append(Path(root))
+                except OSError:
+                    pass
     else:
         roots.append(Path.home())
     return roots
+
+
+def ensure_runtime_directories():
+    """Create the application's writable folders before the UI/scan starts."""
+    APP_DATA.mkdir(parents=True, exist_ok=True)
+    (Path(os.environ.get("LOCALAPPDATA", str(Path.home()))) / QUARANTINE_NAME).mkdir(
+        parents=True, exist_ok=True)
 
 def is_minecraft_candidate(path, text=""):
     """Require Minecraft-specific path or package/loader metadata context."""
@@ -726,11 +761,8 @@ class App:
     def start_scan(self):
         if self.scanning:
             return
-        if os.name == "nt" and not is_admin():
-            if messagebox.askyesno(APP_NAME, "Запросить права администратора Windows для более полного доступа?"):
-                if request_admin_restart():
-                    self.root.destroy()
-                    return
+        # No forced UAC/restart: start scanning immediately. Protected folders
+        # are skipped and counted as access errors; users may run as admin manually.
         for iid in self.tree.get_children():
             self.tree.delete(iid)
         self.items.clear()
@@ -750,14 +782,18 @@ class App:
         for root in roots:
             for current, dirs, files in os.walk(str(root), onerror=lambda e: self.events.put(("error", str(e)))):
                 if self.cancel_event.is_set(): break
-                dirs[:] = [d for d in dirs if d.lower() not in SKIP_DIRS]
+                dirs[:] = [d for d in dirs
+                           if d.lower() not in SKIP_DIRS
+                           and not os.path.islink(os.path.join(current, d))]
                 total += sum(1 for fn in files if Path(fn).suffix.lower() in SCAN_EXTENSIONS)
         self.events.put(("total", total))
         checked = 0
         for root in roots:
             for current, dirs, files in os.walk(str(root), onerror=lambda e: self.events.put(("error", str(e)))):
                 if self.cancel_event.is_set(): break
-                dirs[:] = [d for d in dirs if d.lower() not in SKIP_DIRS]
+                dirs[:] = [d for d in dirs
+                           if d.lower() not in SKIP_DIRS
+                           and not os.path.islink(os.path.join(current, d))]
                 for fn in files:
                     if self.cancel_event.is_set(): break
                     p = Path(current) / fn
@@ -1008,6 +1044,11 @@ class App:
         messagebox.showinfo(APP_NAME, message)
 
 if __name__ == "__main__":
+    try:
+        ensure_runtime_directories()
+    except OSError as exc:
+        # Continue launching; history/quarantine actions will report their own errors.
+        print("Не удалось подготовить папки приложения:", exc)
     root = tk.Tk()
     App(root)
     root.mainloop()
