@@ -84,7 +84,8 @@ KNOWN_CHEAT_NAMES = [
 # generic text files, executables and unrelated archives are intentionally ignored.
 SCAN_EXTENSIONS = {
     ".jar", ".zip", ".class", ".json", ".toml", ".cfg", ".conf",
-    ".ini", ".yml", ".yaml", ".properties", ".accesswidener"
+    ".ini", ".yml", ".yaml", ".properties", ".accesswidener",
+    ".java", ".kt", ".kts", ".scala", ".groovy"
 }
 MINECRAFT_CONTEXT_TERMS = (
     "net/minecraft", "net.minecraft", "com/mojang", "com.mojang",
@@ -143,6 +144,176 @@ def printable_strings(data, min_len=4):
     found = re.findall(rb"[ -~]{%d,}" % min_len, data)
     return "\n".join(x.decode("latin-1", "ignore") for x in found).lower()
 
+
+
+def extract_class_symbols(data):
+    """Parse JVM constant pool and actual invoke instructions; never load the class."""
+    import struct
+    symbols = []
+    try:
+        if len(data) < 12 or data[:4] != b'\xca\xfe\xba\xbe':
+            return symbols
+        pos = 8
+        count = struct.unpack_from('>H', data, pos)[0]; pos += 2
+        pool = [None] * count
+        i = 1
+        while i < count:
+            tag = data[pos]; pos += 1
+            if tag == 1:
+                n = struct.unpack_from('>H', data, pos)[0]; pos += 2
+                pool[i] = data[pos:pos+n].decode('utf-8', 'replace'); pos += n
+            elif tag in (3, 4): pos += 4
+            elif tag in (5, 6): pos += 8; i += 1
+            elif tag == 7: pool[i] = ('class', struct.unpack_from('>H', data, pos)[0]); pos += 2
+            elif tag == 8: pool[i] = ('string', struct.unpack_from('>H', data, pos)[0]); pos += 2
+            elif tag in (9, 10, 11):
+                x, y = struct.unpack_from('>HH', data, pos); pos += 4
+                pool[i] = ('ref', tag, x, y)
+            elif tag == 12:
+                x, y = struct.unpack_from('>HH', data, pos); pos += 4
+                pool[i] = ('nat', x, y)
+            elif tag == 15: pos += 3
+            elif tag in (16, 19, 20): pos += 2
+            elif tag in (17, 18): pos += 4
+            else: return symbols
+            i += 1
+        def utf(index):
+            v = pool[index] if 0 < index < len(pool) else None
+            return v if isinstance(v, str) else ''
+        def class_name(index):
+            v = pool[index] if 0 < index < len(pool) else None
+            return utf(v[1]) if isinstance(v, tuple) and v[0] == 'class' else ''
+        def method_ref(index):
+            v = pool[index] if 0 < index < len(pool) else None
+            if not isinstance(v, tuple) or v[0] != 'ref': return ''
+            owner = class_name(v[2]); nat = pool[v[3]] if v[3] < len(pool) else None
+            if isinstance(nat, tuple) and nat[0] == 'nat':
+                name, desc = utf(nat[1]), utf(nat[2])
+                return owner.replace('/', '.') + '.' + name + desc if owner and name else ''
+            return ''
+        # Skip class header and interfaces.
+        pos += 6
+        interfaces = struct.unpack_from('>H', data, pos)[0]; pos += 2 + interfaces * 2
+        def skip_attributes(offset):
+            n = struct.unpack_from('>H', data, offset)[0]; offset += 2
+            for _ in range(n):
+                name_idx = struct.unpack_from('>H', data, offset)[0]
+                length = struct.unpack_from('>I', data, offset + 2)[0]
+                offset += 6 + length
+            return offset
+        fields = struct.unpack_from('>H', data, pos)[0]; pos += 2
+        for _ in range(fields):
+            pos += 6
+            pos = skip_attributes(pos)
+        methods = struct.unpack_from('>H', data, pos)[0]; pos += 2
+        # JVM bytecode instruction lengths; unspecified opcodes are one byte.
+        two = set([0x10,0x12,0x15,0x16,0x17,0x18,0x19,0x36,0x37,0x38,0x39,0x3a,0xa9,0xbc])
+        three = set([0x11,0x13,0x14,0x84,0x99,0x9a,0x9b,0x9c,0x9d,0x9e,0x9f,0xa0,0xa1,0xa2,0xa3,0xa4,0xa5,0xa6,0xa7,0xa8,0xc6,0xc7,0xbb,0xbd,0xc0,0xc1,0xb2,0xb3,0xb4,0xb5,0xb6,0xb7,0xb8])
+        four = set([0xc5])
+        five = set([0xb9,0xba,0xc8,0xc9])
+        for _ in range(methods):
+            pos += 6
+            attr_count = struct.unpack_from('>H', data, pos)[0]; pos += 2
+            for _ in range(attr_count):
+                attr_name = utf(struct.unpack_from('>H', data, pos)[0])
+                attr_len = struct.unpack_from('>I', data, pos + 2)[0]
+                start = pos + 6
+                if attr_name == 'Code' and attr_len >= 12:
+                    code_len = struct.unpack_from('>I', data, start + 4)[0]
+                    code_start = start + 8
+                    code = data[code_start:code_start + code_len]
+                    pc = 0
+                    while pc < len(code):
+                        op = code[pc]
+                        if op in (0xb6, 0xb7, 0xb8, 0xb9, 0xba) and pc + 2 < len(code):
+                            idx = (code[pc+1] << 8) | code[pc+2]
+                            ref = method_ref(idx)
+                            if ref: symbols.append('INVOKE ' + ref)
+                        if op == 0xaa:  # tableswitch
+                            pad = (4 - ((pc + 1) % 4)) % 4
+                            base = pc + 1 + pad
+                            if base + 12 > len(code): break
+                            low, high = struct.unpack_from('>ii', code, base + 4)
+                            step = 12 + max(0, high - low + 1) * 4
+                        elif op == 0xab:  # lookupswitch
+                            pad = (4 - ((pc + 1) % 4)) % 4
+                            base = pc + 1 + pad
+                            if base + 8 > len(code): break
+                            pairs = struct.unpack_from('>i', code, base + 4)[0]
+                            step = 8 + max(0, pairs) * 8
+                        elif op == 0xc4:  # wide
+                            step = 6 if pc + 1 < len(code) and code[pc+1] == 0x84 else 4
+                        elif op in two: step = 2
+                        elif op in three: step = 3
+                        elif op in four: step = 4
+                        elif op in five: step = 5
+                        else: step = 1
+                        if step <= 0: break
+                        pc += step
+                pos = start + attr_len
+        # Class names aid Minecraft-context validation; method names above are actual calls.
+        for v in pool:
+            if isinstance(v, tuple) and v[0] == 'class':
+                value = utf(v[1])
+                if value: symbols.append(value.replace('/', '.'))
+        return sorted(set(symbols))
+    except Exception:
+        return symbols
+
+
+# API-level evidence is stronger than isolated words: these are Minecraft
+# client/server symbols commonly needed to implement particular mechanics.
+API_RULES = {
+    'Combat automation': [
+        'ClientPlayerInteractionManager.attackEntity', 'PlayerInteractEntityC2SPacket',
+        'attackEntity(', 'doAttack(', 'swingHand(', 'getEntitiesByClass('
+    ],
+    'Entity ESP / through-wall rendering': [
+        'World.getEntities(', 'getEntitiesByClass(', 'EntityRenderer',
+        'LivingEntityRenderer', 'isInvisibleTo(', 'Frustum', 'getBoundingBox('
+    ],
+    'Rotation manipulation': [
+        'PlayerMoveC2SPacket', 'LookAndOnGround', 'getYaw(', 'getPitch(',
+        'setYaw(', 'setPitch(', 'changeLookDirection(', 'sendMovementPackets('
+    ],
+    'Movement modification': [
+        'setVelocity(', 'getAbilities(', 'flying', 'PlayerMoveC2SPacket',
+        'setSprinting(', 'jump(', 'setOnGround('
+    ],
+    'Packet manipulation / bypass': [
+        'ClientConnection.send(', 'sendPacket(', 'NetworkManager.sendPacket(',
+        'ChannelPipeline', 'PacketEncoder', 'PacketDecoder', 'channelRead('
+    ],
+    'Automated inventory / interaction': [
+        'clickSlot(', 'interactBlock(', 'interactItem(', 'updateSlotStacks(',
+        'ClickSlotC2SPacket', 'PlayerActionC2SPacket'
+    ],
+}
+
+
+def analyze_api_behavior(text):
+    lower = text.lower()
+    found = {}
+    for family, needles in API_RULES.items():
+        matches = [n for n in needles if n.lower() in lower]
+        if matches:
+            found[family] = sorted(set(matches))[:10]
+    # A behavior family is meaningful only when its API evidence co-occurs
+    # with another relevant API or an implementation-level indicator.
+    score = 0
+    if 'Combat automation' in found and ('Rotation manipulation' in found or 'Packet manipulation / bypass' in found):
+        score += 7
+    if 'Entity ESP / through-wall rendering' in found and ('world.getentities(' in lower or 'isinvisibleto(' in lower or 'frustum' in lower):
+        score += 6
+    if 'Rotation manipulation' in found and 'Packet manipulation / bypass' in found:
+        score += 6
+    if 'Movement modification' in found and 'Packet manipulation / bypass' in found:
+        score += 5
+    if 'Automated inventory / interaction' in found and 'Packet manipulation / bypass' in found:
+        score += 4
+    return score, found
+
+
 def analyze_text(text, filename):
     hits = {}
     lower_name = filename.lower()
@@ -178,6 +349,33 @@ def analyze_text(text, filename):
 
     return score, hits, known, framework
 
+
+MOJANG_POLICY_INDICATORS = {
+    "Внешняя оплата / play-to-earn": ["play-to-earn", "cashout", "cash out", "withdraw crypto", "real-world currency", "real money payout"],
+    "Проверка владения внешним контентом для игровых функций": ["owns_nft", "has_nft", "verifyownership", "ownershipcheck", "entitlementcheck", "purchasecheck", "paidaccess", "nft gate", "token gate"],
+}
+
+
+def analyze_mojang_policy_indicators(text):
+    """Find technical indicators related to explicit Mojang mod/distribution rules.
+
+    This is not a legal opinion: commercial context, permissions and distribution
+    cannot be established from a JAR's code alone.
+    """
+    lower = text.lower()
+    found = {}
+    for rule, markers in MOJANG_POLICY_INDICATORS.items():
+        matches = [m for m in markers if m in lower]
+        if matches:
+            found[rule] = matches[:8]
+    # Bundling Minecraft implementation classes inside a mod archive can indicate
+    # redistribution of game software; package references alone are not enough.
+    bundled = re.findall(r"(?:^|\n)(?:net/minecraft/(?:client|server)/[^\n]+\.class|com/mojang/blaze3d/[^\n]+\.class)", lower)
+    if bundled:
+        found["Возможное включение классов самой игры в архив"] = bundled[:8]
+    return found
+
+
 def inspect_archive_bytes(blob, depth=0):
     combined = []
     try:
@@ -195,13 +393,14 @@ def inspect_archive_bytes(blob, depth=0):
                 combined.append(name)
                 # Read source/config/class files only, with strict limits.
                 if info.file_size <= 2 * 1024 * 1024 and (
-                    name.endswith((".class", ".py", ".pyw", ".json", ".txt",
-                                   ".cfg", ".yml", ".yaml", ".properties"))
+                    name.endswith((".class", ".java", ".kt", ".kts", ".scala", ".groovy",
+                                   ".json", ".txt", ".cfg", ".toml", ".yml", ".yaml", ".properties"))
                 ):
                     try:
                         raw = zf.read(info)[:2 * 1024 * 1024]
                         if name.endswith(".class"):
                             combined.append(printable_strings(raw))
+                            combined.extend(extract_class_symbols(raw))
                         else:
                             combined.append(raw.decode("utf-8", "ignore").lower())
                     except Exception:
@@ -234,7 +433,9 @@ def inspect_file(path):
     if ext in (".jar", ".zip"):
         fragments = inspect_archive_bytes(raw)
         text = "\n".join(fragments)
-    elif ext == ".class" or ext == ".pyc":
+    elif ext == ".class":
+        text = printable_strings(raw) + "\n" + "\n".join(extract_class_symbols(raw))
+    elif ext == ".pyc":
         text = printable_strings(raw)
     else:
         text = raw.decode("utf-8", "ignore").lower()
@@ -245,31 +446,39 @@ def inspect_file(path):
         return None
 
     score, hits, known, framework = analyze_text(text, name)
+    api_score, api_hits = analyze_api_behavior(text)
+    policy_hits = analyze_mojang_policy_indicators(text)
+    score += api_score
 
-    # Known cheat name in filename is a meaningful signal, but still displayed
-    # as "high suspicion" rather than claiming proof.
+    # A client name is a weak indicator only; code/API combinations carry more weight.
     if any(n in name for n in KNOWN_CHEAT_NAMES):
-        score += 5
+        score += 2
         known = sorted(set(known + [n for n in KNOWN_CHEAT_NAMES if n in name]))
 
-    if not hits and not known:
+    if not hits and not known and not api_hits and not policy_hits:
         return None
 
-    if score >= 12:
+    if api_score >= 10 or score >= 16:
         level = "ВЫСОКАЯ"
-    elif score >= 6:
+    elif api_score >= 5 or score >= 8:
         level = "СРЕДНЯЯ"
     else:
         level = "НИЗКАЯ"
 
     reasons = []
+    for family, terms in api_hits.items():
+        reasons.append("API/ссылки в байткоде — " + family + ": " + ", ".join(terms))
     for family, terms in hits.items():
-        reasons.append(f"{family}: {', '.join(terms)}")
+        reasons.append(f"Текстовые признаки — {family}: {', '.join(terms)}")
+    for rule, markers in policy_hits.items():
+        reasons.append("Риск по критериям Mojang — " + rule + ": " + ", ".join(markers))
     if known:
-        reasons.append("Известное имя чита/клиента: " + ", ".join(known[:4]))
+        reasons.append("Имя известного клиента/чита (не доказательство): " + ", ".join(known[:4]))
     if framework and hits:
-        reasons.append("Контекст модульного клиента: " + ", ".join(framework[:4]))
-    return {"path": path, "score": score, "level": level, "reasons": reasons}
+        reasons.append("Контекст клиентского фреймворка: " + ", ".join(framework[:4]))
+    return {"path": path, "score": score, "level": level, "reasons": reasons,
+            "api_evidence": api_hits, "policy_evidence": policy_hits,
+            "classification": "ТРЕБУЕТ ПРОВЕРКИ — статические признаки не доказывают нарушение"}
 
 class App:
     BG = "#f4f4f4"
@@ -346,7 +555,8 @@ class App:
         tk.Label(self.root,
             text="Ищутся только Minecraft-файлы: JAR, CLASS, архивы модов и метаданные Fabric/Forge. "
                  "Обычные EXE, Python-файлы и посторонние документы пропускаются. "
-                 "Анализ статический: файлы не запускаются; возможны ложные совпадения.",
+                 "Проверяются байткод Java, ссылки на методы Minecraft, метаданные и комбинации игровых API. "
+                 "Это статический анализ: он не исполняет файлы и не может юридически подтвердить нарушение.",
             bg=self.BG, fg=self.MUTED, font=("Segoe UI", 8), wraplength=1050,
             justify="left").pack(anchor="w", padx=22, pady=(0, 12))
 
