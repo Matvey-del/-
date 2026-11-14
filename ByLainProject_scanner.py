@@ -14,8 +14,12 @@ import ctypes
 import threading
 import queue
 import hashlib
+import json
+import html
+import datetime
+import string
 import tkinter as tk
-from tkinter import ttk, messagebox
+from tkinter import ttk, messagebox, filedialog
 from pathlib import Path
 
 APP_NAME = "BY LAINPROJECT"
@@ -25,6 +29,8 @@ MAX_ARCHIVE_ENTRIES = 2500
 MAX_ARCHIVE_TOTAL = 32 * 1024 * 1024
 MAX_NESTED_DEPTH = 2
 QUARANTINE_NAME = "ByLainProject_Quarantine"
+APP_DATA = Path(os.environ.get("LOCALAPPDATA", str(Path.home()))) / "ByLainProject"
+HISTORY_FILE = APP_DATA / "scan_history.json"
 
 # Behavior-oriented terms. A single generic term is deliberately not enough
 # to label a file as a cheat; combinations and context increase confidence.
@@ -126,9 +132,13 @@ def scan_roots():
     # Search the drive for Minecraft-related artifacts, but inspect only the
     # allowlisted Java/archive/metadata extensions and require MC context.
     roots = []
-    c_drive = Path("C:/")
-    if c_drive.exists():
-        roots.append(c_drive)
+    if os.name == "nt":
+        for letter in string.ascii_uppercase:
+            drive = Path(letter + ":\\\\")
+            if drive.exists():
+                roots.append(drive)
+    else:
+        roots.append(Path.home())
     return roots
 
 def is_minecraft_candidate(path, text=""):
@@ -479,6 +489,24 @@ def detect_strong_behavior(text):
     }
 
 
+OBFUSCATION_MARKERS = {
+    "Reflection": ("java/lang/reflect", "java.lang.reflect", "getdeclaredmethod",
+                   "getdeclaredfield", "method.invoke", "class.forname"),
+    "Динамическая загрузка классов": ("classloader", "defineclass", "loadclass",
+                                      "secureclassloader", "urlclassloader"),
+    "Шифрование/декодирование строк": ("javax/crypto", "cipher.getinstance",
+        "secretkey", "stringdecrypt", "decryptstring", "base64.getdecoder",
+        "base64.getdecoder", "xor", "aes/gcm", "aes/cbc"),
+    "Генерация/изменение байткода": ("org/objectweb/asm", "javassist",
+        "bytebuddy", "definehiddenclass", "methodhandles.lookup",
+        "invokedynamic", "classwriter", "classvisitor"),
+}
+def detect_obfuscation(text):
+    low = (text or "").lower()
+    return {label: [m for m in markers if m in low][:10]
+            for label, markers in OBFUSCATION_MARKERS.items()
+            if any(m in low for m in markers)}
+
 def inspect_file(path):
     try:
         size = path.stat().st_size
@@ -512,7 +540,10 @@ def inspect_file(path):
     api_score, api_hits = analyze_api_behavior(text)
     policy_hits = analyze_mojang_policy_indicators(text)
     strong = detect_strong_behavior(text)
+    obfuscation = detect_obfuscation(text)
     score += api_score
+    if len(obfuscation) >= 2:
+        score += 3
     if strong['esp_confirmed']:
         score += 12
     if strong['bypass_confirmed']:
@@ -523,7 +554,7 @@ def inspect_file(path):
         score += 2
         known = sorted(set(known + [n for n in KNOWN_CHEAT_NAMES if n in name]))
 
-    if not hits and not known and not api_hits and not policy_hits and not strong['esp_confirmed'] and not strong['bypass_confirmed']:
+    if not hits and not known and not api_hits and not policy_hits and not strong['esp_confirmed'] and not strong['bypass_confirmed'] and not obfuscation:
         return None
 
     if strong['esp_confirmed'] or strong['bypass_confirmed'] or api_score >= 10 or score >= 16:
@@ -544,6 +575,8 @@ def inspect_file(path):
     if strong['bypass_confirmed']:
         reasons.append("ПРИЗНАК ОБХОДА АНТИЧИТА: найдены bypass/spoof/desync и сетевой контекст: " +
                        ", ".join(strong['bypass_evidence']))
+    for label, markers in obfuscation.items():
+        reasons.append("Индикаторы обфускации — " + label + ": " + ", ".join(markers))
     for rule, markers in policy_hits.items():
         reasons.append("Риск по критериям Mojang — " + rule + ": " + ", ".join(markers))
     if known:
@@ -551,8 +584,9 @@ def inspect_file(path):
     if framework and hits:
         reasons.append("Контекст клиентского фреймворка: " + ", ".join(framework[:4]))
     return {"path": path, "score": score, "level": level, "reasons": reasons,
+            "sha256": hashlib.sha256(raw).hexdigest(),
             "api_evidence": api_hits, "policy_evidence": policy_hits,
-            "strong_evidence": strong,
+            "obfuscation_evidence": obfuscation, "strong_evidence": strong,
             "classification": ("ВЫСОКАЯ ВЕРОЯТНОСТЬ ЧИТА" if strong["esp_confirmed"] or strong["bypass_confirmed"] else "ТРЕБУЕТ ПРОВЕРКИ — статические признаки не доказывают нарушение")}
 
 class App:
@@ -571,16 +605,22 @@ class App:
         self.events = queue.Queue()
         self.items = {}
         self.scanning = False
+        self.cancel_event = threading.Event()
+        self.scan_errors = 0
+        self.history = self.load_history()
+        self.all_results = {}
+        self.scan_root_override = None
         self.build_ui()
         self.root.after(100, self.poll)
 
     def build_ui(self):
-        header = tk.Frame(self.root, bg=self.WHITE, highlightbackground=self.LINE, highlightthickness=1)
-        header.pack(fill="x", padx=22, pady=(20, 12))
-        tk.Label(header, text="BY LAINPROJECT", bg=self.WHITE, fg=self.FG,
-                 font=("Segoe UI", 20, "bold")).pack(anchor="w", padx=20, pady=(16, 0))
+        # Full-width application title bar.
+        header = tk.Frame(self.root, bg=self.WHITE, highlightbackground="#000000", highlightthickness=1)
+        header.pack(fill="x", padx=0, pady=(0, 12))
+        tk.Label(header, text="LainScaner", bg=self.WHITE, fg=self.FG,
+                 font=("Segoe UI", 28, "bold")).pack(fill="x", padx=0, pady=(16, 4))
         tk.Label(header, text="MINECRAFT JAVA / MOD / CLASS SCANNER",
-                 bg=self.WHITE, fg=self.MUTED, font=("Segoe UI", 9)).pack(anchor="w", padx=21, pady=(2, 15))
+                 bg=self.WHITE, fg=self.MUTED, font=("Segoe UI", 9)).pack(fill="x", pady=(0, 14))
 
         bar = tk.Frame(self.root, bg=self.BG)
         bar.pack(fill="x", padx=22, pady=5)
@@ -597,19 +637,49 @@ class App:
         actions = tk.Frame(self.root, bg=self.BG)
         actions.pack(fill="x", padx=22, pady=(0, 12))
         self.scan_btn = tk.Button(actions, text="НАЧАТЬ ПОЛНУЮ ПРОВЕРКУ",
-            command=self.start_scan, bg=self.FG, fg=self.WHITE, activebackground="#333333",
-            activeforeground=self.WHITE, relief="flat", bd=0, padx=18, pady=12,
+            command=self.start_full_scan, bg=self.FG, fg=self.WHITE, activebackground="#333333",
+            activeforeground=self.WHITE, relief="solid", bd=1, highlightthickness=1,
+            highlightbackground="#000000", highlightcolor="#000000", padx=18, pady=12,
             font=("Segoe UI", 9, "bold"), cursor="hand2")
         self.scan_btn.pack(side="left")
+        tk.Button(actions, text="ПАПКА...", command=self.choose_folder,
+            bg=self.WHITE, fg=self.FG, relief="solid", bd=1, padx=12, pady=12,
+            font=("Segoe UI", 9), cursor="hand2").pack(side="left", padx=6)
+        self.stop_btn = tk.Button(actions, text="ОСТАНОВИТЬ", command=self.stop_scan,
+            bg="#eeeeee", fg=self.FG, relief="solid", bd=1, padx=12, pady=12,
+            font=("Segoe UI", 9), state="disabled", cursor="hand2")
+        self.stop_btn.pack(side="left", padx=4)
+        tk.Button(actions, text="HTML", command=lambda: self.export_report("html"),
+            bg=self.WHITE, fg=self.FG, relief="solid", bd=1, padx=10, pady=12).pack(side="right", padx=4)
+        tk.Button(actions, text="TXT", command=lambda: self.export_report("txt"),
+            bg=self.WHITE, fg=self.FG, relief="solid", bd=1, padx=10, pady=12).pack(side="right", padx=4)
+        tk.Button(actions, text="ПОДРОБНОСТИ", command=self.show_details,
+            bg=self.WHITE, fg=self.FG, relief="solid", bd=1, padx=10, pady=12).pack(side="right", padx=4)
         tk.Button(actions, text="ВЫБРАТЬ ВСЁ", command=self.select_all,
-            bg=self.WHITE, fg=self.FG, relief="flat", bd=0, padx=14, pady=12,
+            bg=self.WHITE, fg=self.FG, relief="solid", bd=1, highlightthickness=1,
+            highlightbackground="#000000", highlightcolor="#000000", padx=14, pady=12,
             font=("Segoe UI", 9), cursor="hand2").pack(side="left", padx=8)
         tk.Button(actions, text="СНЯТЬ ВЫБОР", command=self.clear_selection,
-            bg=self.WHITE, fg=self.FG, relief="flat", bd=0, padx=14, pady=12,
+            bg=self.WHITE, fg=self.FG, relief="solid", bd=1, highlightthickness=1,
+            highlightbackground="#000000", highlightcolor="#000000", padx=14, pady=12,
             font=("Segoe UI", 9), cursor="hand2").pack(side="left")
         tk.Button(actions, text="В КАРАНТИН", command=self.quarantine_selected,
-            bg="#e5e5e5", fg=self.FG, relief="flat", bd=0, padx=16, pady=12,
+            bg="#e5e5e5", fg=self.FG, relief="solid", bd=1, highlightthickness=1,
+            highlightbackground="#000000", highlightcolor="#000000", padx=16, pady=12,
             font=("Segoe UI", 9, "bold"), cursor="hand2").pack(side="right")
+
+        filters = tk.Frame(self.root, bg=self.BG)
+        filters.pack(fill="x", padx=22, pady=(0, 8))
+        tk.Label(filters, text="ПОИСК:", bg=self.BG, fg=self.FG).pack(side="left")
+        self.search_var = tk.StringVar()
+        search = tk.Entry(filters, textvariable=self.search_var, width=34)
+        search.pack(side="left", padx=6)
+        self.search_var.trace_add("write", lambda *_: self.apply_filters())
+        tk.Label(filters, text="РИСК:", bg=self.BG, fg=self.FG).pack(side="left", padx=(12, 4))
+        self.risk_var = tk.StringVar(value="Все")
+        riskbox = ttk.Combobox(filters, textvariable=self.risk_var, values=("Все", "ВЫСОКАЯ", "СРЕДНЯЯ", "НИЗКАЯ"), state="readonly", width=12)
+        riskbox.pack(side="left")
+        riskbox.bind("<<ComboboxSelected>>", lambda e: self.apply_filters())
 
         wrap = tk.Frame(self.root, bg=self.WHITE, highlightbackground=self.LINE, highlightthickness=1)
         wrap.pack(fill="both", expand=True, padx=22, pady=(0, 10))
@@ -633,7 +703,7 @@ class App:
             text="Ищутся только Minecraft-файлы: JAR, CLASS, архивы модов и метаданные Fabric/Forge. "
                  "Обычные EXE, Python-файлы и посторонние документы пропускаются. "
                  "Проверяются байткод Java, ссылки на методы Minecraft, метаданные и комбинации игровых API. "
-                 "Это статический анализ: он не исполняет файлы и не может юридически подтвердить нарушение.",
+                 "Статический анализ: файлы не запускаются; эвристики не доказывают нарушение.",
             bg=self.BG, fg=self.MUTED, font=("Segoe UI", 8), wraplength=1050,
             justify="left").pack(anchor="w", padx=22, pady=(0, 12))
 
@@ -648,6 +718,10 @@ class App:
                   foreground=[("selected", self.FG)])
         style.configure("TProgressbar", troughcolor="#e5e5e5",
                         background="#111111", thickness=7)
+
+    def start_full_scan(self):
+        self.scan_root_override = None
+        self.start_scan()
 
     def start_scan(self):
         if self.scanning:
@@ -664,35 +738,42 @@ class App:
         self.count.config(text="ПРОВЕРЕНО: 0    НАХОДОК: 0")
         self.status.config(text="ПОИСК MINECRAFT-ФАЙЛОВ...")
         self.scanning = True
+        self.cancel_event.clear()
+        self.scan_errors = 0
         self.scan_btn.config(state="disabled")
+        self.stop_btn.config(state="normal")
         threading.Thread(target=self.worker, daemon=True).start()
 
     def worker(self):
-        roots = scan_roots()
+        roots = [self.scan_root_override] if self.scan_root_override else scan_roots()
         total = 0
-        # First count candidate files, then scan. System and bulky dependency dirs skipped.
         for root in roots:
-            for current, dirs, files in os.walk(str(root)):
+            for current, dirs, files in os.walk(str(root), onerror=lambda e: self.events.put(("error", str(e)))):
+                if self.cancel_event.is_set(): break
                 dirs[:] = [d for d in dirs if d.lower() not in SKIP_DIRS]
-                for fn in files:
-                    if Path(fn).suffix.lower() in SCAN_EXTENSIONS:
-                        total += 1
+                total += sum(1 for fn in files if Path(fn).suffix.lower() in SCAN_EXTENSIONS)
         self.events.put(("total", total))
         checked = 0
         for root in roots:
-            for current, dirs, files in os.walk(str(root)):
+            for current, dirs, files in os.walk(str(root), onerror=lambda e: self.events.put(("error", str(e)))):
+                if self.cancel_event.is_set(): break
                 dirs[:] = [d for d in dirs if d.lower() not in SKIP_DIRS]
                 for fn in files:
+                    if self.cancel_event.is_set(): break
                     p = Path(current) / fn
                     if p.suffix.lower() not in SCAN_EXTENSIONS:
                         continue
-                    result = inspect_file(p)
-                    checked += 1
-                    if result:
-                        self.events.put(("hit", result))
-                    if checked % 25 == 0 or checked == total:
+                    try:
+                        result = inspect_file(p)
+                        checked += 1
+                        if result:
+                            result["history_status"] = self.record_history(result)
+                            self.events.put(("hit", result))
+                    except Exception as exc:
+                        self.events.put(("error", str(p) + ": " + str(exc)))
+                    if checked % 10 == 0 or checked == total:
                         self.events.put(("progress", checked, total))
-        self.events.put(("done", checked, total))
+        self.events.put(("done", checked, total, self.cancel_event.is_set()))
 
     def poll(self):
         try:
@@ -705,10 +786,13 @@ class App:
                     p = r["path"]
                     iid = self.tree.insert("", "end", values=(
                         "□", r["level"], p.name, p.suffix.lower(),
-                        " | ".join(r["reasons"][:3]), str(p)),
+                        " | ".join([r.get("history_status", "")] + r["reasons"][:3]), str(p)),
                         tags=(r["level"].lower(),))
                     self.items[iid] = {"result": r, "selected": False}
+                    self.all_results[iid] = self.items[iid]
                     self.sort_results_english()
+                elif e[0] == "error":
+                    self.scan_errors += 1
                 elif e[0] == "progress":
                     _, n, total = e
                     self.progress["maximum"] = max(1, total)
@@ -727,16 +811,120 @@ class App:
             pass
         self.root.after(100, self.poll)
 
+    def load_history(self):
+        try:
+            APP_DATA.mkdir(parents=True, exist_ok=True)
+            return json.loads(HISTORY_FILE.read_text(encoding="utf-8"))
+        except Exception:
+            return {}
+
+    def save_history(self):
+        try:
+            APP_DATA.mkdir(parents=True, exist_ok=True)
+            HISTORY_FILE.write_text(json.dumps(self.history, ensure_ascii=False, indent=2), encoding="utf-8")
+        except Exception:
+            pass
+
+    def record_history(self, result):
+        key = str(result["path"]).casefold()
+        old = self.history.get(key)
+        status = "НОВЫЙ ФАЙЛ" if not old else ("БЕЗ ИЗМЕНЕНИЙ" if old.get("sha256") == result["sha256"] else "ВЕРСИЯ ИЗМЕНЕНА")
+        result["previous_sha256"] = old.get("sha256") if old else None
+        result["history_status"] = status
+        self.history[key] = {"sha256": result["sha256"], "last_seen": datetime.datetime.now().isoformat(timespec="seconds")}
+        self.save_history()
+        return status
+
+    def choose_folder(self):
+        chosen = filedialog.askdirectory(title="Выберите папку для проверки")
+        if chosen:
+            self.scan_root_override = Path(chosen)
+            self.status.config(text="ВЫБРАНА ПАПКА: " + chosen)
+            self.start_scan()
+
+    def stop_scan(self):
+        if self.scanning:
+            self.cancel_event.set()
+            self.status.config(text="ОСТАНОВКА ПО ЗАПРОСУ...")
+
+    def apply_filters(self):
+        if not hasattr(self, "tree"):
+            return
+        query = self.search_var.get().casefold()
+        risk = self.risk_var.get()
+        for iid, item in self.items.items():
+            r = item["result"]
+            hay = (str(r["path"]) + " " + " ".join(r["reasons"])).casefold()
+            visible = (not query or query in hay) and (risk == "Все" or r["level"] == risk)
+            if visible:
+                if not self.tree.exists(iid):
+                    p = r["path"]
+                    self.tree.insert("", "end", iid=iid, values=("☑" if item["selected"] else "□",
+                        r["level"], p.name, p.suffix.lower(), " | ".join([r.get("history_status", "")] + r["reasons"][:3]), str(p)),
+                        tags=(r["level"].lower(),))
+            elif self.tree.exists(iid):
+                self.tree.detach(iid)
+        self.sort_results_english()
+
+    def show_details(self):
+        selection = self.tree.selection()
+        iid = selection[0] if selection else None
+        if iid not in self.items:
+            messagebox.showinfo(APP_NAME, "Выберите строку результата.")
+            return
+        r = self.items[iid]["result"]
+        detail = ("Файл: " + str(r["path"]) + "\\nРиск: " + r["level"] +
+                  "\\nОценка: " + str(r["score"]) + "\\nSHA-256: " + r["sha256"] +
+                  "\\nИстория: " + r.get("history_status", "—") +
+                  "\\nПредыдущий SHA-256: " + str(r.get("previous_sha256") or "—") +
+                  "\\nКлассификация: " + r["classification"] +
+                  "\\n\\nПричины:\\n- " + "\\n- ".join(r["reasons"]))
+        win = tk.Toplevel(self.root); win.title("Подробности обнаружения"); win.geometry("760x520")
+        box = tk.Text(win, wrap="word"); box.pack(fill="both", expand=True, padx=10, pady=10)
+        box.insert("1.0", detail); box.config(state="disabled")
+
+    def export_report(self, kind):
+        results = [x["result"] for x in self.items.values()]
+        if not results:
+            messagebox.showinfo(APP_NAME, "Нет результатов для экспорта.")
+            return
+        ext = ".html" if kind == "html" else ".txt"
+        target = filedialog.asksaveasfilename(defaultextension=ext,
+            filetypes=[("HTML", "*.html")] if kind == "html" else [("Text", "*.txt")])
+        if not target: return
+        if kind == "txt":
+            body = "\\n\\n".join(
+                f"{r['level']} | {r['path']}\\nSHA-256: {r['sha256']}\\nИстория: {r.get('history_status','—')}\\n" +
+                "\\n".join("- " + x for x in r["reasons"]) for r in results)
+        else:
+            rows = []
+            for r in results:
+                rows.append("<article><h2>" + html.escape(r["level"] + " — " + r["path"].name) +
+                    "</h2><p><b>Путь:</b> " + html.escape(str(r["path"])) +
+                    "<br><b>SHA-256:</b> " + r["sha256"] +
+                    "<br><b>История:</b> " + html.escape(r.get("history_status", "—")) +
+                    "</p><ul>" + "".join("<li>" + html.escape(x) + "</li>" for x in r["reasons"]) + "</ul></article>")
+            body = "<!doctype html><meta charset='utf-8'><title>LainScaner report</title><h1>LainScaner — отчёт</h1>" + "".join(rows)
+        try:
+            Path(target).write_text(body, encoding="utf-8")
+            messagebox.showinfo(APP_NAME, "Отчёт сохранён: " + target)
+        except Exception as exc:
+            messagebox.showerror(APP_NAME, "Не удалось сохранить отчёт: " + str(exc))
+
     def sort_results_english(self):
-        # Sort strictly by English filename order A-Z (case-insensitive).
+        # Priority first: HIGH -> MEDIUM -> LOW. Within each priority,
+        # keep the English filename order A-Z (case-insensitive).
+        priority_order = {"ВЫСОКАЯ": 0, "СРЕДНЯЯ": 1, "НИЗКАЯ": 2}
         rows = []
         for iid in self.tree.get_children(""):
             values = self.tree.item(iid, "values")
+            risk = str(values[1]).strip().upper()
             filename = str(values[2]).casefold()
             fullpath = str(values[5]).casefold()
-            rows.append((filename, fullpath, iid))
-        rows.sort(key=lambda row: (row[0], row[1]))
-        for index, (_, _, iid) in enumerate(rows):
+            priority = priority_order.get(risk, 3)
+            rows.append((priority, filename, fullpath, iid))
+        rows.sort(key=lambda row: (row[0], row[1], row[2]))
+        for index, (_, _, _, iid) in enumerate(rows):
             self.tree.move(iid, "", index)
 
     def open_containing_folder(self, event):
