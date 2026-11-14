@@ -80,11 +80,24 @@ KNOWN_CHEAT_NAMES = [
     "tenacity", "moon client", "horion", "lb++", "liquidbounce plus"
 ]
 
+# Only Minecraft Java artifacts and metadata are candidates. Python scripts,
+# generic text files, executables and unrelated archives are intentionally ignored.
 SCAN_EXTENSIONS = {
-    ".jar", ".zip", ".class", ".py", ".pyw", ".pyc",
-    ".json", ".cfg", ".conf", ".ini", ".yml", ".yaml",
-    ".properties", ".txt"
+    ".jar", ".zip", ".class", ".json", ".toml", ".cfg", ".conf",
+    ".ini", ".yml", ".yaml", ".properties", ".accesswidener"
 }
+MINECRAFT_CONTEXT_TERMS = (
+    "net/minecraft", "net.minecraft", "com/mojang", "com.mojang",
+    "net/fabricmc", "net.fabricmc", "net/minecraftforge",
+    "net.minecraftforge", "org/spongepowered/asm/mixin",
+    "org.spongepowered.asm.mixin", "fabric.mod.json", "mods.toml",
+    "mcmod.info", "minecraftforge", "yarn", "intermediary",
+    "net.fabricmc", "net.minecraftforge", "modmenu", "mixins.json"
+)
+MINECRAFT_PATH_MARKERS = (
+    ".minecraft", "minecraft\\mods", "minecraft/mods",
+    "curseforge", "prismlauncher", "multimc", "modrinth", "technic"
+)
 SKIP_DIRS = {
     "$recycle.bin", "system volume information", "windows", "winsxs",
     "installer", "driverstore", "node_modules", ".git", "__pycache__",
@@ -109,13 +122,21 @@ def request_admin_restart():
         return False
 
 def scan_roots():
-    # Full C: user-data scan, including hidden AppData and .minecraft.
-    # Windows/system directories are excluded to avoid damaging/slow scans.
+    # Search the drive for Minecraft-related artifacts, but inspect only the
+    # allowlisted Java/archive/metadata extensions and require MC context.
     roots = []
     c_drive = Path("C:/")
     if c_drive.exists():
         roots.append(c_drive)
     return roots
+
+def is_minecraft_candidate(path, text=""):
+    """Require Minecraft-specific path or package/loader metadata context."""
+    p = str(path).lower().replace("\\", "/")
+    if any(marker in p for marker in MINECRAFT_PATH_MARKERS):
+        return True
+    haystack = (text or "").lower()
+    return any(term in haystack for term in MINECRAFT_CONTEXT_TERMS)
 
 def printable_strings(data, min_len=4):
     # Extract readable ASCII/UTF-8-ish fragments from Java bytecode and binaries.
@@ -202,7 +223,9 @@ def inspect_file(path):
         if size > MAX_FILE_SIZE:
             return None
         with path.open("rb") as f:
-            raw = f.read(MAX_TEXT_READ)
+            # ZIP/JAR central directories are at the end of the archive.
+            # Read the complete bounded archive so its entries can be inspected.
+            raw = f.read() if path.suffix.lower() in (".jar", ".zip") else f.read(MAX_TEXT_READ)
     except (OSError, PermissionError):
         return None
 
@@ -215,6 +238,11 @@ def inspect_file(path):
         text = printable_strings(raw)
     else:
         text = raw.decode("utf-8", "ignore").lower()
+
+    # Ignore generic files even if they happen to contain words such as
+    # "aura", "reach" or "velocity": Minecraft context is mandatory.
+    if not is_minecraft_candidate(path, text):
+        return None
 
     score, hits, known, framework = analyze_text(text, name)
 
@@ -267,7 +295,7 @@ class App:
         header.pack(fill="x", padx=22, pady=(20, 12))
         tk.Label(header, text="BY LAINPROJECT", bg=self.WHITE, fg=self.FG,
                  font=("Segoe UI", 20, "bold")).pack(anchor="w", padx=20, pady=(16, 0))
-        tk.Label(header, text="STATIC JAVA / PYTHON CHEAT ANALYSIS",
+        tk.Label(header, text="MINECRAFT JAVA / MOD / CLASS SCANNER",
                  bg=self.WHITE, fg=self.MUTED, font=("Segoe UI", 9)).pack(anchor="w", padx=21, pady=(2, 15))
 
         bar = tk.Frame(self.root, bg=self.BG)
@@ -316,8 +344,9 @@ class App:
         self.tree.tag_configure("low", foreground="#777777")
 
         tk.Label(self.root,
-            text="Проверяется доступное содержимое диска C: (кроме системных папок Windows). "
-                 "Анализ статический: файлы не запускаются. Совпадения могут быть ложными.",
+            text="Ищутся только Minecraft-файлы: JAR, CLASS, архивы модов и метаданные Fabric/Forge. "
+                 "Обычные EXE, Python-файлы и посторонние документы пропускаются. "
+                 "Анализ статический: файлы не запускаются; возможны ложные совпадения.",
             bg=self.BG, fg=self.MUTED, font=("Segoe UI", 8), wraplength=1050,
             justify="left").pack(anchor="w", padx=22, pady=(0, 12))
 
@@ -346,7 +375,7 @@ class App:
         self.items.clear()
         self.progress["value"] = 0
         self.count.config(text="ПРОВЕРЕНО: 0    НАХОДОК: 0")
-        self.status.config(text="ИДЁТ ПОЛНАЯ ПРОВЕРКА...")
+        self.status.config(text="ПОИСК MINECRAFT-ФАЙЛОВ...")
         self.scanning = True
         self.scan_btn.config(state="disabled")
         threading.Thread(target=self.worker, daemon=True).start()
