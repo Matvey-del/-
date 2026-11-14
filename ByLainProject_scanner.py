@@ -416,6 +416,69 @@ def inspect_archive_bytes(blob, depth=0):
         pass
     return combined
 
+
+# Stronger semantic indicators for the user's requested ESP / bypass checks.
+# These are evaluated as combinations, not as isolated keywords.
+ESP_ENTITY_MARKERS = (
+    "playeresp", "entityesp", "itemesp", "chestesp", "wallhack", "tracers",
+    "nametag", "getentities", "getentitiesbyclass", "livingentityrenderer",
+    "entityrenderer", "renderentity", "renderentities", "rendername",
+    "itemrenderer", "renderitem", "entityoutline", "outlineprovider",
+)
+ESP_THROUGH_WALL_MARKERS = (
+    "disabledepthtest", "depthtest", "depth_test", "depthfunc", "gl_always",
+    "glalways", "always", "no_depth", "nodepth", "throughwall", "through_wall",
+    "see_through", "seethrough", "depthmask", "depth_mask", "renderlayer",
+    "rendertype", "linestrip", "linewidth", "outline", "glow", "shader",
+)
+ANTICHEAT_BYPASS_MARKERS = (
+    "anticheatbypass", "anti_cheat_bypass", "bypassanticheat",
+    "grimac", "grim_bypass", "matrix_bypass", "watchdog_bypass",
+    "verus_bypass", "ncp_bypass", "vulcan_bypass", "intave_bypass",
+    "spoofpacket", "packetspoof", "spoof_rotation", "silentrotation",
+    "rotationspoof", "blink", "desync", "badpackets", "transaction",
+    "keepalive", "brandspoof", "clientbrand", "protocolhack",
+)
+
+def detect_strong_behavior(text):
+    """Return strong behavior evidence when implementation clues co-occur."""
+    low = text.lower()
+    entity = sorted({m for m in ESP_ENTITY_MARKERS if m in low})
+    wall = sorted({m for m in ESP_THROUGH_WALL_MARKERS if m in low})
+    bypass = sorted({m for m in ANTICHEAT_BYPASS_MARKERS if m in low})
+
+    # Require both entity/player/item rendering context and a depth/overlay
+    # technique. A normal renderer or outline effect alone is not sufficient.
+    esp_confirmed = bool(entity and wall and (
+        any(x in low for x in ("disabledepthtest", "depthfunc", "gl_always",
+                               "glalways", "throughwall", "through_wall",
+                               "no_depth", "nodepth", "depthmask"))
+        or ("outline" in low and any(x in low for x in
+                                     ("player", "entity", "item", "livingentity")))
+    ))
+    # A bypass verdict requires anti-cheat-specific language or a combination
+    # of spoofing/desync and network packet manipulation indicators.
+    packet_context = any(x in low for x in (
+        "sendpacket", "clientconnection", "networkmanager", "packet",
+        "channelpipeline", "packetencoder", "packetdecoder"
+    ))
+    bypass_confirmed = bool(
+        any(x in low for x in ("anticheatbypass", "anti_cheat_bypass",
+                               "bypassanticheat", "grim_bypass", "matrix_bypass",
+                               "watchdog_bypass", "verus_bypass", "ncp_bypass",
+                               "vulcan_bypass", "intave_bypass"))
+        or (packet_context and len(bypass) >= 2 and any(
+            x in low for x in ("spoof", "desync", "blink", "silentrotation")))
+    )
+    return {
+        "esp_confirmed": esp_confirmed,
+        "esp_entity_evidence": entity[:12],
+        "esp_render_evidence": wall[:12],
+        "bypass_confirmed": bypass_confirmed,
+        "bypass_evidence": bypass[:12],
+    }
+
+
 def inspect_file(path):
     try:
         size = path.stat().st_size
@@ -448,17 +511,22 @@ def inspect_file(path):
     score, hits, known, framework = analyze_text(text, name)
     api_score, api_hits = analyze_api_behavior(text)
     policy_hits = analyze_mojang_policy_indicators(text)
+    strong = detect_strong_behavior(text)
     score += api_score
+    if strong['esp_confirmed']:
+        score += 12
+    if strong['bypass_confirmed']:
+        score += 12
 
     # A client name is a weak indicator only; code/API combinations carry more weight.
     if any(n in name for n in KNOWN_CHEAT_NAMES):
         score += 2
         known = sorted(set(known + [n for n in KNOWN_CHEAT_NAMES if n in name]))
 
-    if not hits and not known and not api_hits and not policy_hits:
+    if not hits and not known and not api_hits and not policy_hits and not strong['esp_confirmed'] and not strong['bypass_confirmed']:
         return None
 
-    if api_score >= 10 or score >= 16:
+    if strong['esp_confirmed'] or strong['bypass_confirmed'] or api_score >= 10 or score >= 16:
         level = "ВЫСОКАЯ"
     elif api_score >= 5 or score >= 8:
         level = "СРЕДНЯЯ"
@@ -470,6 +538,12 @@ def inspect_file(path):
         reasons.append("API/ссылки в байткоде — " + family + ": " + ", ".join(terms))
     for family, terms in hits.items():
         reasons.append(f"Текстовые признаки — {family}: {', '.join(terms)}")
+    if strong['esp_confirmed']:
+        reasons.append("ПОДТВЕРЖДЁННЫЙ ПРИЗНАК ESP ЧЕРЕЗ СТЕНЫ: найдены сущности/игроки/предметы и техники обхода глубины/обводки: " +
+                       ", ".join(strong['esp_entity_evidence'] + strong['esp_render_evidence']))
+    if strong['bypass_confirmed']:
+        reasons.append("ПРИЗНАК ОБХОДА АНТИЧИТА: найдены bypass/spoof/desync и сетевой контекст: " +
+                       ", ".join(strong['bypass_evidence']))
     for rule, markers in policy_hits.items():
         reasons.append("Риск по критериям Mojang — " + rule + ": " + ", ".join(markers))
     if known:
@@ -478,7 +552,8 @@ def inspect_file(path):
         reasons.append("Контекст клиентского фреймворка: " + ", ".join(framework[:4]))
     return {"path": path, "score": score, "level": level, "reasons": reasons,
             "api_evidence": api_hits, "policy_evidence": policy_hits,
-            "classification": "ТРЕБУЕТ ПРОВЕРКИ — статические признаки не доказывают нарушение"}
+            "strong_evidence": strong,
+            "classification": ("ВЫСОКАЯ ВЕРОЯТНОСТЬ ЧИТА" if strong["esp_confirmed"] or strong["bypass_confirmed"] else "ТРЕБУЕТ ПРОВЕРКИ — статические признаки не доказывают нарушение")}
 
 class App:
     BG = "#f4f4f4"
@@ -548,9 +623,11 @@ class App:
             self.tree.column(c, width=widths[c], minwidth=40, stretch=c in ("reason", "path"))
         self.tree.pack(fill="both", expand=True, padx=8, pady=8)
         self.tree.bind("<Double-1>", self.toggle)
-        self.tree.tag_configure("high", foreground="#111111")
-        self.tree.tag_configure("medium", foreground="#444444")
-        self.tree.tag_configure("low", foreground="#777777")
+        self.tree.bind("<Double-Button-3>", self.open_containing_folder)
+        # Risk level colors: green -> yellow/orange -> red.
+        self.tree.tag_configure("high", foreground="#e53935")
+        self.tree.tag_configure("medium", foreground="#f39c12")
+        self.tree.tag_configure("low", foreground="#2eaa57")
 
         tk.Label(self.root,
             text="Ищутся только Minecraft-файлы: JAR, CLASS, архивы модов и метаданные Fabric/Forge. "
@@ -631,6 +708,7 @@ class App:
                         " | ".join(r["reasons"][:3]), str(p)),
                         tags=(r["level"].lower(),))
                     self.items[iid] = {"result": r, "selected": False}
+                    self.sort_results_english()
                 elif e[0] == "progress":
                     _, n, total = e
                     self.progress["maximum"] = max(1, total)
@@ -648,6 +726,37 @@ class App:
         except queue.Empty:
             pass
         self.root.after(100, self.poll)
+
+    def sort_results_english(self):
+        # Sort strictly by English filename order A-Z (case-insensitive).
+        rows = []
+        for iid in self.tree.get_children(""):
+            values = self.tree.item(iid, "values")
+            filename = str(values[2]).casefold()
+            fullpath = str(values[5]).casefold()
+            rows.append((filename, fullpath, iid))
+        rows.sort(key=lambda row: (row[0], row[1]))
+        for index, (_, _, iid) in enumerate(rows):
+            self.tree.move(iid, "", index)
+
+    def open_containing_folder(self, event):
+        # Two consecutive right-clicks on a result open the folder containing the mod.
+        iid = self.tree.identify_row(event.y)
+        if iid not in self.items:
+            return
+        path = self.items[iid]["result"]["path"]
+        try:
+            folder = str(path.parent.resolve())
+            if os.name == "nt":
+                os.startfile(folder)
+            elif sys.platform == "darwin":
+                import subprocess
+                subprocess.Popen(["open", folder])
+            else:
+                import subprocess
+                subprocess.Popen(["xdg-open", folder])
+        except Exception as exc:
+            messagebox.showerror(APP_NAME, "Не удалось открыть папку:\\n" + str(exc))
 
     def toggle(self, event):
         iid = self.tree.identify_row(event.y)
